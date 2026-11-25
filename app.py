@@ -374,9 +374,18 @@ def get_dem(bbox, width):
     return dm.fetch_dem(bbox, width)
 
 
+@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False, max_entries=6)
+def get_outlines(bbox):
+    try:
+        return dm.fetch_lake_outlines(bbox)
+    except Exception as e:
+        ds._note("USGS lake outline (NHD)", e)
+        return []
+
+
 @st.cache_resource(show_spinner=False, max_entries=6)
-def get_bed(lake_key, bbox, width, offset, survey_key, _dem, _lake, _survey):
-    return dm.LakeBed(_dem, _lake, offset, _survey)
+def get_bed(lake_key, bbox, width, offset, survey_key, n_outlines, _dem, _lake, _survey, _outlines):
+    return dm.LakeBed(_dem, _lake, offset, _survey, _outlines)
 
 
 with tabs[1]:
@@ -426,7 +435,8 @@ with tabs[1]:
         with st.spinner("Loading USGS lidar terrain for the lake (first time takes ~10–30 s)…"):
             dem = get_dem(bbox, width)
             skey = (len(survey), float(pd.util.hash_pandas_object(survey).sum())) if survey is not None else None
-            bed = get_bed(choice, bbox, width, round(offset, 2), skey, dem, lake, survey)
+            outlines = get_outlines(bbox)
+            bed = get_bed(choice, bbox, width, round(offset, 2), skey, len(outlines), dem, lake, survey, outlines)
     except Exception as e:
         st.error(f"Couldn't build the depth map: {e}")
 
@@ -450,8 +460,8 @@ with tabs[1]:
         corners = bed.corners_ll()
 
         layers = [{"sourcetype": "raster", "source": dm.BASEMAPS[basemap], "below": "traces",
-                   "sourceattribution": dm.ATTRIBUTION}]
-        if basemap == "Satellite + labels":
+                   "sourceattribution": dm.BASEMAP_CREDIT.get(basemap, dm.ATTRIBUTION) + " · Terrain: USGS 3DEP"}]
+        if basemap.endswith("+ labels"):
             layers.append({"sourcetype": "raster", "source": [dm.LABELS_URL], "below": "traces"})
         layers += [{"sourcetype": "image", "source": depth_img, "coordinates": corners, "opacity": opacity, "below": "traces"},
                    {"sourcetype": "image", "source": line_img, "coordinates": corners, "opacity": 1.0, "below": "traces"}]
@@ -508,7 +518,8 @@ with tabs[1]:
             f"measured. Depths below it are **estimated** ({est_pct:.0%} of the lake bed) from distance to shore and to "
             f"the dam, scaled to a ~{lake.get('max_depth_ft', '?')} ft maximum depth"
             + (f"; {bed.survey_used:,} uploaded soundings replace the estimate where they reach." if bed.survey_used else ".")
-            + " Not for navigation. Satellite imagery shows the lake on the day it was photographed, which may be a different level.")
+            + " Not for navigation. Satellite imagery shows the lake on the day it was photographed, which may be a different level."
+            + (" Lake outline from the USGS National Hydrography Dataset." if bed.outline_mask is not None else ""))
 
 
 # ------------------------------------------------------------------------------------

@@ -34,13 +34,23 @@ M_TO_FT = 3.28084
 R_EARTH = 6378137.0
 DEM_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
 
+ESRI_IMG = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 BASEMAPS = {
-    "Satellite": ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
-    "Satellite + labels": ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+    # one cloud-free mosaic for the whole country, so VA and NC match (10 m detail)
+    "Satellite – even color (Sentinel-2)": ["https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg"],
+    # sharpest, but stitched from different photo sources per area, so colors can change at state lines
+    "Satellite – high detail (Esri)": [ESRI_IMG],
+    "Satellite – high detail + labels": [ESRI_IMG],
+    "Aerial photo (USGS / NAIP)": ["https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"],
     "USGS topo": ["https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}"],
 }
-LABELS_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
-ATTRIBUTION = "Imagery © Esri, Maxar, Earthstar Geographics · Terrain: USGS 3DEP"
+BASEMAP_CREDIT = {
+    "Satellite – even color (Sentinel-2)": "Sentinel-2 cloudless 2023 by EOX IT Services (contains modified Copernicus Sentinel data)",
+    "Aerial photo (USGS / NAIP)": "USGS The National Map / USDA NAIP",
+    "USGS topo": "USGS The National Map",
+}
+ATTRIBUTION = "Imagery © Esri, Maxar, Earthstar Geographics"
+NHD_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12/query"
 
 
 # ----------------------------------------------------------------------------- projections
@@ -82,9 +92,35 @@ def fetch_dem(bbox, width=1600):
     return {"elev_m": dem, "merc": (x0, y0, x1, y1), "bbox": bbox}
 
 
+def fetch_lake_outlines(bbox, min_km2=2.0):
+    """Lake/reservoir polygons (USGS National Hydrography Dataset) in Web-Mercator metres."""
+    r = requests.get(NHD_URL, params={
+        "geometry": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}", "geometryType": "esriGeometryEnvelope",
+        "inSR": 4326, "spatialRel": "esriSpatialRelIntersects", "where": "1=1", "outFields": "*",
+        "returnGeometry": "true", "outSR": 3857, "maxAllowableOffset": 15, "f": "geojson",
+    }, headers={"User-Agent": "LakeLevelTracker/1.0"}, timeout=90)
+    r.raise_for_status()
+    polys = []
+    for f in r.json().get("features", []):
+        props = {k.lower(): v for k, v in (f.get("properties") or {}).items()}
+        area = props.get("areasqkm")
+        g = f.get("geometry") or {}
+        rings_sets = [g["coordinates"]] if g.get("type") == "Polygon" else g.get("coordinates", []) if g.get("type") == "MultiPolygon" else []
+        for rings in rings_sets:
+            if area is None:
+                xy = np.asarray(rings[0])
+                a = 0.5 * abs(np.dot(xy[:, 0], np.roll(xy[:, 1], 1)) - np.dot(xy[:, 1], np.roll(xy[:, 0], 1))) / 1e6
+            else:
+                a = area
+            if a and a >= min_km2 * 0.5:
+                polys.append(rings)
+    return polys
+
+
 # ----------------------------------------------------------------------------- lake bed
 class LakeBed:
-    def __init__(self, dem: dict, lake: dict, datum_offset_ft: float, survey: pd.DataFrame | None = None):
+    def __init__(self, dem: dict, lake: dict, datum_offset_ft: float, survey: pd.DataFrame | None = None,
+                 outlines: list | None = None):
         self.lake = lake
         self.offset = datum_offset_ft
         self.x0, self.y0, self.x1, self.y1 = dem["merc"]
@@ -97,6 +133,7 @@ class LakeBed:
         self.px_acres = self.px_m ** 2 / 4046.856
 
         land_ft = e * M_TO_FT + datum_offset_ft
+        self.outline_mask = self._rasterize(outlines) if outlines else None
         self._find_lake_surface(land_ft)
         self._estimate_depths(land_ft)
         self.survey_used = 0
@@ -105,6 +142,18 @@ class LakeBed:
         self.bottom_ft[np.isnan(self.bottom_ft)] = np.nanmax(self.bottom_ft)
         self.seed = np.unravel_index(np.argmin(np.where(self.lake_mask, self.bottom_ft, np.inf)), self.bottom_ft.shape)
         self._cache = {}
+
+    def _rasterize(self, polys):
+        from PIL import ImageDraw
+        img = Image.new("L", (self.W, self.H), 0)
+        d = ImageDraw.Draw(img)
+        for rings in polys:
+            for k, ring in enumerate(rings):
+                xy = np.asarray(ring, dtype=float)
+                px = [((x - self.x0) / self.res_merc, (self.y1 - y) / self.res_merc) for x, y in xy]
+                if len(px) >= 3:
+                    d.polygon(px, fill=1 if k == 0 else 0)
+        return np.array(img, dtype=bool)
 
     # Lidar shows the lake as perfectly flat ("hydro-flattened") water. A lake that spans
     # several lidar projects (e.g. the VA and NC halves of Kerr) has one flat surface per
@@ -115,28 +164,61 @@ class LakeBed:
         hi = max(self.lake.get("flood_top") or norm + 10, norm) + 2
         filled = np.where(np.isfinite(land_ft), land_ft, -9999.0)
         local_range = ndi.maximum_filter(filled, 3) - ndi.minimum_filter(filled, 3)
-        flat = (local_range < 0.05) & (filled > lo) & (filled < hi)
+        flat = (local_range < 0.1) & (filled > lo) & (filled < hi)
         lab, n = ndi.label(flat)
-        if n == 0:
+        if n == 0 and self.outline_mask is None:
             raise RuntimeError("Couldn't find the lake surface in the elevation data for this map area.")
         idx = np.arange(1, n + 1)
-        sizes = ndi.sum(flat, lab, index=idx)
-        keep = idx[(sizes >= max(300, 0.02 * sizes.max()))]
+        sizes = ndi.sum(flat, lab, index=idx) if n else np.array([0.0])
+        keep = idx[(sizes >= max(300, 0.02 * sizes.max()))] if n else idx
         surf = np.isin(lab, keep)
-        levels = ndi.mean(filled, lab, index=keep)
-        # per-pixel water-surface level, filled across seams between lidar projects
+        levels = list(ndi.mean(filled, lab, index=keep)) if len(keep) else []
         level_of_label = np.zeros(n + 1)
         level_of_label[keep] = levels
-        w_pix = np.where(surf, level_of_label[lab], np.nan)
-        mask = ndi.binary_closing(surf, iterations=3)
-        mask = ndi.binary_fill_holes(mask)
-        _, (ni, nj) = ndi.distance_transform_edt(~surf, return_indices=True)
-        w_pix = w_pix[ni, nj]
+        w_flat = np.where(surf, level_of_label[lab], np.nan)
+
+        mask = ndi.binary_fill_holes(ndi.binary_closing(surf, iterations=3))
+        if self.outline_mask is not None:
+            om = self.outline_mask
+            # drop outlines that sit well below the lake (river / lake below the dam)
+            lab_o, no = ndi.label(om)
+            if no:
+                med = ndi.median(filled, lab_o, index=np.arange(1, no + 1))
+                ref = min(levels) if levels else lo
+                good = np.arange(1, no + 1)[np.asarray(med) > ref - 15]
+                om = np.isin(lab_o, good)
+            mask |= om
+        # keep only water connected to the main lake surface
+        lab_m, nm = ndi.label(mask)
+        if nm > 1:
+            anchor = surf if surf.any() else mask
+            ids = np.unique(lab_m[anchor & (lab_m > 0)])
+            if len(ids):
+                sz = ndi.sum(anchor, lab_m, index=ids)
+                main = ids[np.asarray(sz) >= 0.05 * np.max(sz)]
+                mask = np.isin(lab_m, main)
+
+        # water-surface level for every lake pixel: the flat lidar level where we found one,
+        # otherwise the terrain value itself (smoothed), limited to a plausible pool range
+        smooth = ndi.median_filter(filled, size=5)
+        w_pix = np.where(np.isfinite(w_flat), w_flat, np.clip(smooth, lo, hi))
+        if surf.any():
+            _, (ni, nj) = ndi.distance_transform_edt(~surf, return_indices=True)
+            near = w_flat[ni, nj]
+            # pixels in the outline without a flat surface: use their own value if it is in range,
+            # else the nearest flat surface
+            bad = ~np.isfinite(w_flat) & ((smooth < lo) | (smooth > hi))
+            w_pix = np.where(bad, near, w_pix)
+        if not levels:
+            levels = [float(np.nanmedian(w_pix[mask]))]
+            sizes = np.array([float(mask.sum())]); keep = np.array([1])
+        self.flat_found = surf
         mask &= ~(np.isfinite(land_ft) & (land_ft > w_pix + 1.5))
         self.lake_mask = mask
         self.w_pix = w_pix
-        self.lidar_levels = sorted({round(float(v), 1) for v, s in zip(levels, sizes[keep - 1]) if s >= 0.05 * sizes.max()})
-        self.lidar_level_ft = float(np.average(levels, weights=sizes[keep - 1]))
+        wts = np.asarray(sizes)[np.asarray(keep) - 1] if len(sizes) >= len(keep) else np.ones(len(levels))
+        self.lidar_levels = sorted({round(float(v), 1) for v, s_ in zip(levels, wts) if s_ >= 0.05 * max(wts)})
+        self.lidar_level_ft = float(np.average(levels, weights=wts))
         # Water well below the lake surface outside the lake (e.g. the river below the dam)
         # must never join the lake, even if the dam is broken up in the terrain data.
         self.barrier = ~mask & np.isfinite(land_ft) & (land_ft < min(levels) - 15)
