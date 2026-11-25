@@ -30,6 +30,11 @@ import requests
 from PIL import Image
 from scipy import ndimage as ndi
 
+try:
+    import contourpy
+except ImportError:  # vector shorelines need contourpy (a matplotlib dependency)
+    contourpy = None
+
 M_TO_FT = 3.28084
 R_EARTH = 6378137.0
 DEM_URL = "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
@@ -44,6 +49,8 @@ BASEMAPS = {
     "Aerial photo (USGS / NAIP)": ["https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"],
     "USGS topo": ["https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}"],
 }
+BASEMAP_MAX_NATIVE = {"Satellite – even color (Sentinel-2)": 14, "Aerial photo (USGS / NAIP)": 16, "USGS topo": 16}
+LABELS_ATTR = "Labels © Esri"
 BASEMAP_CREDIT = {
     "Satellite – even color (Sentinel-2)": "Sentinel-2 cloudless 2023 by EOX IT Services (contains modified Copernicus Sentinel data)",
     "Aerial photo (USGS / NAIP)": "USGS The National Map / USDA NAIP",
@@ -117,8 +124,97 @@ def fetch_lake_outlines(bbox, min_km2=2.0):
     return polys
 
 
+# ----------------------------------------------------------------------------- shared helpers
+class _GridMixin:
+    """Things both the whole-lake grid and a zoomed-in detail grid can do."""
+
+    def depth_at(self, lon, lat, level_ft):
+        x, y = ll_to_merc(lon, lat)
+        j = int((x - self.x0) / self.res_merc)
+        i = int((self.y1 - y) / self.res_merc)
+        if not (0 <= i < self.H and 0 <= j < self.W):
+            return None
+        w = self.water(level_ft)
+        return {"wet": bool(w[i, j]), "depth": float(level_ft - self.bottom_ft[i, j]) if w[i, j] else 0.0,
+                "bottom": float(self.bottom_ft[i, j]), "estimated": bool(self.estimated[i, j])}
+
+    def shoreline_paths(self, level_ft, min_points=6, step=1):
+        """Smooth vector shoreline(s) for a level, as a list of (lats, lons) arrays."""
+        w = self.water(level_ft)
+        if not w.any():
+            return []
+        allowed = ndi.binary_dilation(w, iterations=2)
+        field = np.where(allowed, self.bottom_ft, level_ft + 50.0)
+        if contourpy is not None:
+            gen = contourpy.contour_generator(z=field, line_type="Separate")
+            lines = gen.lines(level_ft)
+            segs = [(ln[:, 1], ln[:, 0]) for ln in lines if len(ln) >= min_points]  # (row, col)
+        else:  # fall back to pixel edges
+            e = w & ~ndi.binary_erosion(w)
+            r, c = np.nonzero(e)
+            segs = [(r.astype(float), c.astype(float))] if len(r) else []
+        out = []
+        for r, c in segs:
+            r, c = r[::step], c[::step]
+            lon, lat = merc_to_ll(self.x0 + (c + 0.5) * self.res_merc, self.y1 - (r + 0.5) * self.res_merc)
+            out.append((lat, lon))
+        return out
+
+    def bounds_latlon(self):
+        lon0, lat1 = merc_to_ll(self.x0, self.y1)
+        lon1, lat0 = merc_to_ll(self.x1, self.y0)
+        return [[float(lat0), float(lon0)], [float(lat1), float(lon1)]]
+
+
+class DetailBed(_GridMixin):
+    """A sharper grid for the zoomed-in view: real lidar terrain at that zoom (down to ~1 m),
+    with the whole-lake model supplying lake-bed estimates and which water connects to the lake."""
+
+    def __init__(self, coarse: "LakeBed", dem: dict):
+        self.coarse = coarse
+        self.lake = coarse.lake
+        self.x0, self.y0, self.x1, self.y1 = dem["merc"]
+        e = dem["elev_m"]
+        self.H, self.W = e.shape
+        self.res_merc = (self.x1 - self.x0) / self.W
+        self.px_m = self.res_merc * coarse.scale
+        self.px_acres = self.px_m ** 2 / 4046.856
+        land = e * M_TO_FT + coarse.offset
+        # fine pixel centres -> fractional coarse indices
+        jj = (self.x0 + (np.arange(self.W) + 0.5) * self.res_merc - coarse.x0) / coarse.res_merc - 0.5
+        ii = (coarse.y1 - (self.y1 - (np.arange(self.H) + 0.5) * self.res_merc)) / coarse.res_merc - 0.5
+        I, J = np.meshgrid(ii, jj, indexing="ij")
+        coords = np.array([I, J])
+        samp = lambda a, order=1: ndi.map_coordinates(a.astype(float), coords, order=order, mode="nearest")
+        lake_frac = samp(coarse.lake_mask)
+        w_surf = samp(np.nan_to_num(coarse.w_pix, nan=coarse.lidar_level_ft))
+        bottom_c = samp(coarse.bottom_ft)
+        land = np.where(np.isfinite(land), land, bottom_c)
+        on_lake = (lake_frac > 0.5) & (land <= w_surf + 1.0)
+        self.bottom_ft = np.where(on_lake, np.minimum(bottom_c, land - 0.5), land)
+        self.estimated = on_lake & (samp(coarse.estimated, 0) > 0.5)
+        self.barrier = samp(coarse.barrier, 0) > 0.5
+        self._coords = coords
+        self._cache = {}
+
+    def water(self, level_ft):
+        key = round(level_ft, 2)
+        if key not in self._cache:
+            wet = (self.bottom_ft < level_ft) & ~self.barrier
+            lab, n = ndi.label(wet)
+            cw = ndi.map_coordinates(self.coarse.water(level_ft).astype(float), self._coords, order=0, mode="nearest") > 0.5
+            ids = np.unique(lab[cw & wet])
+            ids = ids[ids > 0]
+            self._cache[key] = np.isin(lab, ids) if len(ids) else np.zeros_like(wet)
+            if len(self._cache) > 8:
+                self._cache.pop(next(iter(self._cache)))
+        return self._cache[key]
+
+    render_depth = None  # assigned below (shared with LakeBed)
+
+
 # ----------------------------------------------------------------------------- lake bed
-class LakeBed:
+class LakeBed(_GridMixin):
     def __init__(self, dem: dict, lake: dict, datum_offset_ft: float, survey: pd.DataFrame | None = None,
                  outlines: list | None = None):
         self.lake = lake
@@ -353,6 +449,9 @@ class LakeBed:
         depth = level_ft - self.bottom_ft[i, j]
         est = self.estimated[i, j]
         return pd.DataFrame({"lon": lon, "lat": lat, "depth": depth, "bottom": self.bottom_ft[i, j], "estimated": est})
+
+
+DetailBed.render_depth = LakeBed.render_depth
 
 
 def to_data_url(rgba: np.ndarray) -> str:

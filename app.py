@@ -15,6 +15,8 @@ import streamlit as st
 
 import data_sources as ds
 import depth_map as dm
+import folium
+from streamlit_folium import st_folium
 from lakes import DEFAULT_LAKE, LAKES, custom_lake
 from model import LakeModel, climatology_bands, guide_curve_series, outlook_ratio_by_month
 
@@ -388,13 +390,100 @@ def get_bed(lake_key, bbox, width, offset, survey_key, n_outlines, _dem, _lake, 
     return dm.LakeBed(_dem, _lake, offset, _survey, _outlines)
 
 
+@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False, max_entries=40)
+def get_dem_view(view_bbox, width):
+    return dm.fetch_dem(view_bbox, width)
+
+
+_fragment = getattr(st, "fragment", None) or (lambda f: f)
+
+
+@_fragment
+def render_map(lake, bed, bbox, basemap, shade_level, opacity, contour_ft, line_specs, sel_date):
+    """Interactive map. Re-runs on its own when you pan/zoom, fetching sharper terrain for the view."""
+    key = f"depthmap_{lake['short']}"
+    view = st.session_state.get(key) or {}
+    center = view.get("center") or {"lat": (bbox[1] + bbox[3]) / 2, "lng": (bbox[0] + bbox[2]) / 2}
+    zoom = view.get("zoom") or int(round(math.log2(900 * 360 / (256 * (bbox[2] - bbox[0])))))
+    b = view.get("bounds") or {}
+    grid, detail_note = bed, "whole-lake view"
+    try:
+        sw, ne = b.get("_southWest"), b.get("_northEast")
+        if sw and ne and zoom >= 13:
+            # pad the view a little so small pans don't leave blank edges; round so the cache is reused
+            pad = 0.15
+            dlon, dlat = ne["lng"] - sw["lng"], ne["lat"] - sw["lat"]
+            vb = (sw["lng"] - pad * dlon, sw["lat"] - pad * dlat, ne["lng"] + pad * dlon, ne["lat"] + pad * dlat)
+            q = 10 ** max(2, min(4, zoom - 11))
+            vb = tuple(round(v * q) / q for v in vb)
+            vb = (max(vb[0], bbox[0]), max(vb[1], bbox[1]), min(vb[2], bbox[2]), min(vb[3], bbox[3]))
+            if vb[2] > vb[0] and vb[3] > vb[1]:
+                with st.spinner("Loading sharper terrain for this view…"):
+                    fine = get_dem_view(vb, 1400)
+                grid = dm.DetailBed(bed, fine)
+                detail_note = f"detail view · {grid.px_m:.1f} m terrain pixels"
+    except Exception as e:
+        detail_note = f"detail unavailable ({e})"
+        grid = bed
+
+    m = folium.Map(location=[center["lat"], center["lng"]], zoom_start=zoom, tiles=None,
+                   max_zoom=19, control_scale=True, prefer_canvas=True)
+    for name, urls in dm.BASEMAPS.items():
+        folium.TileLayer(tiles=urls[0], attr=dm.BASEMAP_CREDIT.get(name, dm.ATTRIBUTION), name=name,
+                         max_zoom=19, max_native_zoom=dm.BASEMAP_MAX_NATIVE.get(name, 19),
+                         overlay=False, control=True, show=(name == basemap)).add_to(m)
+    if basemap.endswith("+ labels"):
+        folium.TileLayer(tiles=dm.LABELS_URL, attr=dm.LABELS_ATTR, name="Labels", overlay=True,
+                         max_zoom=19).add_to(m)
+
+    img = grid.render_depth(shade_level, contour_ft=contour_ft)
+    folium.raster_layers.ImageOverlay(dm.to_data_url(img), bounds=grid.bounds_latlon(), opacity=opacity,
+                                      name=f"Depth at {shade_level:.1f} ft", interactive=False,
+                                      zindex=2).add_to(m)
+    step = 1 if grid is not bed else 2
+    for level, color, dash, label in line_specs:
+        fg = folium.FeatureGroup(name=label)
+        for lat, lon in grid.shoreline_paths(level, step=step):
+            folium.PolyLine(list(zip(lat.round(6), lon.round(6))), color=color, weight=3 if dash is None else 2,
+                            dash_array=dash, opacity=0.95, tooltip=label).add_to(fg)
+        fg.add_to(m)
+    folium.Marker([lake["lat"], lake["lon"]], tooltip="Dam / lake gauge",
+                  icon=folium.Icon(color="red", icon="tint")).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+
+    out = st_folium(m, key=key, height=720, use_container_width=True,
+                    returned_objects=["bounds", "zoom", "center", "last_clicked"])
+
+    clicked = (out or {}).get("last_clicked")
+    c1, c2 = st.columns([3, 2])
+    c1.caption(f"Map: {detail_note}. Use the layers button (top right) to switch imagery or hide lines.")
+    if clicked:
+        info = grid.depth_at(clicked["lng"], clicked["lat"], shade_level) or bed.depth_at(clicked["lng"], clicked["lat"], shade_level)
+        if info and info["wet"]:
+            c2.markdown(f"📍 **{info['depth']:.0f} ft deep** at {shade_level:.1f} ft "
+                        f"(bottom {info['bottom']:.0f} ft, {'estimated' if info['estimated'] else 'measured'})")
+        elif info:
+            c2.markdown(f"📍 Dry at {shade_level:.1f} ft — ground at {info['bottom']:.0f} ft")
+    st.markdown(
+        "<div style='font-size:0.9em'>"
+        "<span style='display:inline-block;width:120px;height:12px;background:linear-gradient(to right,#c6ecff,#041e5a);"
+        "vertical-align:middle'></span> shallow → deep &nbsp; "
+        "<span style='background:#deb870;padding:0 8px'>&nbsp;</span> lakebed exposed (below normal pool) &nbsp; "
+        "<span style='background:#ff781e;padding:0 8px'>&nbsp;</span> flooded land above normal pool &nbsp; "
+        "<span style='color:#e6c800'>━━</span> current &nbsp; <span style='color:#ff00ff'>━━</span> projected &nbsp; "
+        "<span style='color:#ff69b4'>╍╍</span> likely range &nbsp; <span style='color:#999'>╍╍</span> normal pool (white)"
+        "</div>", unsafe_allow_html=True)
+
+
 with tabs[1]:
-    st.markdown("Water depth and shoreline on satellite imagery. Hover over the water to read depths.")
-    o1, o2, o3, o4 = st.columns([1.2, 1, 1, 1])
-    basemap = o1.selectbox("Base map", list(dm.BASEMAPS), index=0)
-    detail = o2.selectbox("Detail", ["Standard", "High (slower)"], index=0)
-    shade_at = o3.selectbox("Shade depths at", ["Projected level", "Current level"], index=0)
-    opacity = o4.slider("Depth shading opacity", 0.0, 1.0, 0.7, 0.05)
+    st.markdown("Water depth and shoreline on satellite imagery. **Zoom in and the map re-draws in more detail** "
+                "(down to ~1–3 m from USGS lidar). Click anywhere on the water to read the depth.")
+    o1, o2, o3, o4 = st.columns([1.3, 1, 1, 1])
+    basemap = o1.selectbox("Base map", list(dm.BASEMAPS), index=1)
+    shade_at = o2.selectbox("Shade depths at", ["Projected level", "Current level"], index=0)
+    opacity = o3.slider("Depth shading opacity", 0.0, 1.0, 0.6, 0.05)
+    contour_ft = o4.selectbox("Depth contours every", [None, 5, 10, 20], index=2,
+                              format_func=lambda v: "off" if v is None else f"{v} ft")
 
     if proj is not None:
         opts = [TODAY] + list(proj.index[6::7])
@@ -429,75 +518,29 @@ with tabs[1]:
         bbox = dm.default_bbox(lake)
         st.caption(f"Map area: {bbox[0]:.3f}, {bbox[1]:.3f} to {bbox[2]:.3f}, {bbox[3]:.3f} (set `map_bbox` in lakes.py).")
 
-    width = 1500 if detail == "Standard" else 2400
     bed = None
     try:
-        with st.spinner("Loading USGS lidar terrain for the lake (first time takes ~10–30 s)…"):
-            dem = get_dem(bbox, width)
+        with st.spinner("Loading USGS lidar terrain for the whole lake (first time takes ~10–30 s)…"):
+            dem = get_dem(bbox, 1600)
             skey = (len(survey), float(pd.util.hash_pandas_object(survey).sum())) if survey is not None else None
             outlines = get_outlines(bbox)
-            bed = get_bed(choice, bbox, width, round(offset, 2), skey, len(outlines), dem, lake, survey, outlines)
+            bed = get_bed(choice, bbox, 1600, round(offset, 2), skey, len(outlines), dem, lake, survey, outlines)
     except Exception as e:
         st.error(f"Couldn't build the depth map: {e}")
 
     if bed is not None:
         shade_level = p_mid if shade_at == "Projected level" else current
-        lines = []
+        line_specs = []
         if show_norm:
-            lines.append((lake["normal_pool"], (255, 255, 255), True))
+            line_specs.append((lake["normal_pool"], "#ffffff", "8 6", f"Normal pool {lake['normal_pool']:g} ft"))
         if show_rng and proj is not None and sel_date != TODAY:
-            lines += [(p_lo, (255, 105, 180), True), (p_hi, (255, 105, 180), True)]
+            line_specs += [(p_lo, "#ff69b4", "6 6", f"Projected low (10%) {p_lo:.1f} ft"),
+                           (p_hi, "#ff69b4", "6 6", f"Projected high (90%) {p_hi:.1f} ft")]
         if show_proj and proj is not None and sel_date != TODAY:
-            lines.append((p_mid, (255, 0, 255), False))
+            line_specs.append((p_mid, "#ff00ff", None, f"Projected {sel_date:%b %d}: {p_mid:.1f} ft"))
         if show_cur:
-            lines.append((current, (255, 230, 0), False))
-        thick = 2 if width <= 1600 else 3
-
-        with st.spinner("Drawing depths and shorelines…"):
-            depth_img = dm.to_data_url(bed.render_depth(shade_level))
-            line_img = dm.to_data_url(bed.render_lines(lines, thickness=thick))
-            hp = bed.hover_points(shade_level)
-        corners = bed.corners_ll()
-
-        layers = [{"sourcetype": "raster", "source": dm.BASEMAPS[basemap], "below": "traces",
-                   "sourceattribution": dm.BASEMAP_CREDIT.get(basemap, dm.ATTRIBUTION) + " · Terrain: USGS 3DEP"}]
-        if basemap.endswith("+ labels"):
-            layers.append({"sourcetype": "raster", "source": [dm.LABELS_URL], "below": "traces"})
-        layers += [{"sourcetype": "image", "source": depth_img, "coordinates": corners, "opacity": opacity, "below": "traces"},
-                   {"sourcetype": "image", "source": line_img, "coordinates": corners, "opacity": 1.0, "below": "traces"}]
-
-        ScatterMap = getattr(go, "Scattermap", None) or go.Scattermapbox
-        map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
-        fig = go.Figure()
-        fig.add_trace(ScatterMap(
-            lon=hp["lon"], lat=hp["lat"], mode="markers",
-            marker=dict(size=7, color="rgba(0,0,0,0.01)"),
-            customdata=np.column_stack([hp["depth"], hp["bottom"], np.where(hp["estimated"], "estimated", "measured")]),
-            hovertemplate=f"Depth at {shade_level:.1f} ft: <b>%{{customdata[0]:.0f}} ft</b><br>"
-                          "Bottom elevation: %{customdata[1]:.0f} ft (%{customdata[2]})<extra></extra>",
-            name="depth", showlegend=False))
-        fig.add_trace(ScatterMap(lon=[lake["lon"]], lat=[lake["lat"]], mode="markers+text",
-                                 marker=dict(size=11, color="red"), text=["Dam / gauge"],
-                                 textposition="top right", textfont=dict(color="white"),
-                                 hoverinfo="text", showlegend=False))
-        lon_span = bbox[2] - bbox[0]
-        zoom = math.log2(900 * 360 / (256 * lon_span)) - 0.2
-        fig.update_layout(**{map_key: dict(style="white-bg", layers=layers, zoom=zoom,
-                                           center=dict(lon=(bbox[0] + bbox[2]) / 2, lat=(bbox[1] + bbox[3]) / 2))},
-                          height=720, margin=dict(l=0, r=0, t=0, b=0))
-        st.plotly_chart(fig, **W, config={"scrollZoom": True})
-
-        st.markdown(
-            "<div style='font-size:0.9em'>"
-            "<span style='display:inline-block;width:120px;height:12px;background:linear-gradient(to right,#c6ecff,#041e5a);"
-            "vertical-align:middle'></span> shallow → deep &nbsp; "
-            "<span style='background:#deb870;padding:0 8px'>&nbsp;</span> lakebed exposed (below normal pool) &nbsp; "
-            "<span style='background:#ff781e;padding:0 8px'>&nbsp;</span> flooded land above normal pool &nbsp; "
-            "<span style='color:#e6c800'>━━</span> current shoreline &nbsp; "
-            "<span style='color:#ff00ff'>━━</span> projected shoreline &nbsp; "
-            "<span style='color:#ff69b4'>╍╍</span> projected likely range &nbsp; "
-            "<span style='color:#999'>╍╍</span> normal pool (white on map) &nbsp; thin white lines = 10-ft depth contours"
-            "</div>", unsafe_allow_html=True)
+            line_specs.append((current, "#ffe600", None, f"Current: {current:.1f} ft"))
+        render_map(lake, bed, bbox, basemap, shade_level, opacity, contour_ft, line_specs, sel_date)
 
         s_now, s_sel, s_norm = bed.stats(current), bed.stats(p_mid), bed.stats(lake["normal_pool"])
         m1, m2, m3, m4 = st.columns(4)
@@ -511,7 +554,7 @@ with tabs[1]:
 
         est_pct = bed.estimated.sum() / max(bed.lake_mask.sum(), 1)
         st.caption(
-            f"Terrain: USGS 3DEP lidar (≈{bed.px_m:.0f} m pixels). The lidar was flown with the lake at about "
+            f"Terrain: USGS 3DEP lidar. The lidar was flown with the lake at about "
             f"**{' / '.join(f'{v:.1f}' for v in bed.lidar_levels)} ft**"
             f"{' (separate surveys for different parts of the lake)' if len(bed.lidar_levels) > 1 else ''}, "
             "so ground above that level — banks, flats, coves and the flood pool — is "
