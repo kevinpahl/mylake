@@ -20,6 +20,10 @@ Add your own lakes by copying an entry. Anything left as None is simply skipped.
 LAKES = {
     "John H. Kerr Lake (Buggs Island), VA/NC": {
         "short": "Kerr Lake",
+        # depth map: area to map (lon_min, lat_min, lon_max, lat_max) - east edge stops at the dam
+        "map_bbox": (-78.90, 36.36, -78.302, 36.80),
+        "max_depth_ft": 100,        # approx. deepest point at normal pool (near the dam)
+        "datum_offset_ft": 0.9,     # NGVD29 minus NAVD88 here (approx.; fine-tune in the app)
         "usgs_site": "02079490",
         "lat": 36.5989,
         "lon": -78.3017,
@@ -76,6 +80,7 @@ LAKES = {
     },
     "Falls Lake, NC": {
         "short": "Falls Lake",
+        "map_bbox": (-78.86, 35.93, -78.57, 36.12), "max_depth_ft": 45, "datum_offset_ft": 0.9,
         "usgs_site": "02087182",
         "lat": 35.9408, "lon": -78.5825,
         "cwms_office": "SAW",
@@ -93,6 +98,7 @@ LAKES = {
     },
     "B. Everett Jordan Lake, NC": {
         "short": "Jordan Lake",
+        "map_bbox": (-79.15, 35.65, -78.92, 35.92), "max_depth_ft": 55, "datum_offset_ft": 0.9,
         "usgs_site": "02098197",
         "lat": 35.6547, "lon": -79.0683,
         "cwms_office": "SAW",
@@ -110,6 +116,7 @@ LAKES = {
     },
     "Philpott Lake, VA": {
         "short": "Philpott Lake",
+        "map_bbox": (-80.13, 36.76, -80.01, 36.86), "max_depth_ft": 160, "datum_offset_ft": 0.8,
         "usgs_site": "02071900",
         "lat": 36.7812, "lon": -80.0278,
         "cwms_office": "SAW",
@@ -127,6 +134,7 @@ LAKES = {
     },
     "Lake Sidney Lanier, GA": {
         "short": "Lake Lanier",
+        "map_bbox": (-84.12, 34.15, -83.80, 34.47), "max_depth_ft": 160, "datum_offset_ft": 0.7,
         "usgs_site": "02334400",
         "lat": 34.16, "lon": -84.07,
         "cwms_office": "SAM",
@@ -144,6 +152,7 @@ LAKES = {
     },
     "Hartwell Lake, SC/GA": {
         "short": "Hartwell Lake",
+        "map_bbox": (-83.10, 34.33, -82.74, 34.75), "max_depth_ft": 180, "datum_offset_ft": 0.7,
         "usgs_site": "02187010",
         "lat": 34.475, "lon": -82.816,
         "cwms_office": "SAS",
@@ -161,6 +170,7 @@ LAKES = {
     },
     "J. Strom Thurmond Lake (Clarks Hill), SC/GA": {
         "short": "Thurmond Lake",
+        "map_bbox": (-82.65, 33.65, -82.18, 34.05), "max_depth_ft": 150, "datum_offset_ft": 0.7,
         "usgs_site": "02193900",
         "lat": 33.840, "lon": -82.350,
         "cwms_office": "SAS",
@@ -185,6 +195,7 @@ def custom_lake(name, usgs_site, lat, lon, normal_pool, flood_top):
     """Build a minimal catalog entry for a lake the user types in."""
     return {
         "short": name, "usgs_site": usgs_site, "lat": lat, "lon": lon,
+        "max_depth_ft": 60, "datum_offset_ft": 0.0,
         "cwms_office": None, "cwms_pattern": None, "datum": "gauge datum",
         "pools": {"Top of flood pool": flood_top, "Normal pool": normal_pool},
         "normal_pool": normal_pool, "flood_top": flood_top, "min_pool": None,

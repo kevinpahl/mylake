@@ -21,6 +21,7 @@ per hour. The app caches everything, so normal use is fine either way.
 | Tab | What it shows |
 |---|---|
 | Level & projection | Observed level, historical normal range for each date, the Corps guide curve, pool elevations, and the projected level with a likely range. The weekly table shows the chance of being above full pool, or more than 2 ft below the guide curve. |
+| Depth map | Satellite view of the lake shaded by water depth, with the current shoreline (yellow), projected shoreline for any week you pick (magenta, with optional likely-range lines), normal-pool shoreline (white dashed), 10-ft depth contours, exposed lakebed (tan) and flooded land above normal pool (orange). Hover to read depths; shows surface area and volume now vs. projected. |
 | Weather | Rainfall averaged over the whole watershed for the past 14 and next 16 days vs. normal, highs and lows, how 4 weather models compare, and the NWS forecast text. |
 | Long-range outlook | ECMWF seasonal rainfall by month vs. normal, NOAA CPC 6–10 day, 8–14 day, monthly and seasonal outlook maps, and U.S. Drought Monitor status of nearby counties. |
 | Inflows & Corps data | Upstream river flows (USGS), Army Corps CWMS elevation, inflow, release and storage, and NWS river forecast points nearby. |
@@ -47,10 +48,18 @@ It's a statistical estimate, not the Corps' official forecast. Planned drawdowns
 scheduling or emergency releases can override it. The Model tab's hindcast shows how far off it
 has been in the past.
 
+## About the depth map
+
+* Land, banks, coves and the flood pool come from **USGS 3DEP lidar** terrain, so shorelines above the level the lake was at when the lidar was flown are measured. The app reports that level.
+* Lidar can't see underwater, and there's no public whole-lake survey of Kerr, so depths **below** that level are **estimated** from distance to shore and to the dam, scaled to the lake's approximate maximum depth (`max_depth_ft` in lakes.py). Treat the estimated depth colors as a rough picture, not a fishing or navigation chart.
+* If you have real soundings (sonar log export, survey points), upload a CSV with `lon, lat, bottom_elev_ft` in the map's settings and they replace the estimate wherever they reach.
+* Terrain is NAVD88 and Kerr's gauge is NGVD29. `datum_offset_ft` (~0.9 ft at Kerr) converts between them. Nudge it in the app if the white normal-pool line doesn't sit on the satellite shoreline.
+* The terrain download is cached for 30 days, so only the first load is slow.
+
 ## Adding a lake
 
 Copy an entry in `lakes.py`. The essentials are `usgs_site`, `lat`/`lon`, `normal_pool`,
-`flood_top`, `guide_curve` and a few `basin_points` spread over the upstream watershed. For Corps
+`flood_top`, `guide_curve`, a few `basin_points`, and for the depth map `map_bbox` and `max_depth_ft` spread over the upstream watershed. For Corps
 data, set `cwms_office` (district code such as SAW, SAM or SAS) and `cwms_pattern` (a regex matching the
 CWMS location name). The app finds the matching time series automatically.
 
