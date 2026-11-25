@@ -5,6 +5,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 
 import numpy as np
@@ -13,6 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import data_sources as ds
+import depth_map as dm
 from lakes import DEFAULT_LAKE, LAKES, custom_lake
 from model import LakeModel, climatology_bands, guide_curve_series, outlook_ratio_by_month
 
@@ -279,7 +281,7 @@ if proj is not None:
         col.metric(f"Projected in {d // 7} wks ({proj.index[d - 1]:%b %d})", f"{row['p50']:.1f} ft",
                    f"{row['p50'] - current:+.1f} ft · range {rng}", delta_color="off")
 
-tabs = st.tabs(["📈 Level & projection", "🌧️ Weather (next 16 days)", "🗓️ Long-range outlook",
+tabs = st.tabs(["📈 Level & projection", "🗺️ Depth map", "🌧️ Weather (next 16 days)", "🗓️ Long-range outlook",
                 "🏞️ Inflows & Corps data", "📰 News", "ℹ️ Lake info", "⚙️ Model & sources"])
 
 # ------------------------------------------------------------------------------------
@@ -365,9 +367,152 @@ with tabs[0]:
                    "Corps of Engineers forecast — planned releases or drawdowns can change the outcome.")
 
 # ------------------------------------------------------------------------------------
+# Tab: depth map
+# ------------------------------------------------------------------------------------
+@st.cache_data(ttl=30 * 24 * 3600, show_spinner=False, max_entries=6)
+def get_dem(bbox, width):
+    return dm.fetch_dem(bbox, width)
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def get_bed(lake_key, bbox, width, offset, survey_key, _dem, _lake, _survey):
+    return dm.LakeBed(_dem, _lake, offset, _survey)
+
+
+with tabs[1]:
+    st.markdown("Water depth and shoreline on satellite imagery. Hover over the water to read depths.")
+    o1, o2, o3, o4 = st.columns([1.2, 1, 1, 1])
+    basemap = o1.selectbox("Base map", list(dm.BASEMAPS), index=0)
+    detail = o2.selectbox("Detail", ["Standard", "High (slower)"], index=0)
+    shade_at = o3.selectbox("Shade depths at", ["Projected level", "Current level"], index=0)
+    opacity = o4.slider("Depth shading opacity", 0.0, 1.0, 0.7, 0.05)
+
+    if proj is not None:
+        opts = [TODAY] + list(proj.index[6::7])
+        sel_date = st.select_slider("Projection date", options=opts, value=opts[min(4, len(opts) - 1)],
+                                    format_func=lambda d: "Today" if d == TODAY else d.strftime("%b %d, %Y"))
+    else:
+        sel_date = TODAY
+    if sel_date == TODAY or proj is None:
+        p_mid = p_lo = p_hi = current
+    else:
+        r = proj.loc[sel_date]
+        p_mid, p_lo, p_hi = float(r["p50"]), float(r.get("p10", r["p50"])), float(r.get("p90", r["p50"]))
+
+    l1, l2, l3, l4 = st.columns(4)
+    show_cur = l1.checkbox("Current shoreline", True)
+    show_proj = l2.checkbox("Projected shoreline", proj is not None)
+    show_rng = l3.checkbox("Projected likely range", False)
+    show_norm = l4.checkbox("Normal-pool shoreline", True)
+
+    with st.expander("Datum, real depth soundings, and map area"):
+        offset = st.number_input(f"Lake datum ({lake.get('datum')}) minus NAVD88, ft", value=float(lake.get("datum_offset_ft", 0.0)),
+                                 step=0.1, format="%.2f",
+                                 help="The terrain data is in NAVD88. Around Kerr Lake NGVD29 ≈ NAVD88 + ~0.9 ft. "
+                                      "Nudge this if the normal-pool shoreline doesn't match the satellite shoreline.")
+        up = st.file_uploader("Optional: CSV of real depth soundings (columns: lon, lat, bottom_elev_ft)", type="csv")
+        survey = None
+        if up is not None:
+            try:
+                survey = pd.read_csv(up)
+            except Exception as e:
+                st.error(f"Couldn't read CSV: {e}")
+        bbox = dm.default_bbox(lake)
+        st.caption(f"Map area: {bbox[0]:.3f}, {bbox[1]:.3f} to {bbox[2]:.3f}, {bbox[3]:.3f} (set `map_bbox` in lakes.py).")
+
+    width = 1500 if detail == "Standard" else 2400
+    bed = None
+    try:
+        with st.spinner("Loading USGS lidar terrain for the lake (first time takes ~10–30 s)…"):
+            dem = get_dem(bbox, width)
+            skey = (len(survey), float(pd.util.hash_pandas_object(survey).sum())) if survey is not None else None
+            bed = get_bed(choice, bbox, width, round(offset, 2), skey, dem, lake, survey)
+    except Exception as e:
+        st.error(f"Couldn't build the depth map: {e}")
+
+    if bed is not None:
+        shade_level = p_mid if shade_at == "Projected level" else current
+        lines = []
+        if show_norm:
+            lines.append((lake["normal_pool"], (255, 255, 255), True))
+        if show_rng and proj is not None and sel_date != TODAY:
+            lines += [(p_lo, (255, 105, 180), True), (p_hi, (255, 105, 180), True)]
+        if show_proj and proj is not None and sel_date != TODAY:
+            lines.append((p_mid, (255, 0, 255), False))
+        if show_cur:
+            lines.append((current, (255, 230, 0), False))
+        thick = 2 if width <= 1600 else 3
+
+        with st.spinner("Drawing depths and shorelines…"):
+            depth_img = dm.to_data_url(bed.render_depth(shade_level))
+            line_img = dm.to_data_url(bed.render_lines(lines, thickness=thick))
+            hp = bed.hover_points(shade_level)
+        corners = bed.corners_ll()
+
+        layers = [{"sourcetype": "raster", "source": dm.BASEMAPS[basemap], "below": "traces",
+                   "sourceattribution": dm.ATTRIBUTION}]
+        if basemap == "Satellite + labels":
+            layers.append({"sourcetype": "raster", "source": [dm.LABELS_URL], "below": "traces"})
+        layers += [{"sourcetype": "image", "source": depth_img, "coordinates": corners, "opacity": opacity, "below": "traces"},
+                   {"sourcetype": "image", "source": line_img, "coordinates": corners, "opacity": 1.0, "below": "traces"}]
+
+        ScatterMap = getattr(go, "Scattermap", None) or go.Scattermapbox
+        map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
+        fig = go.Figure()
+        fig.add_trace(ScatterMap(
+            lon=hp["lon"], lat=hp["lat"], mode="markers",
+            marker=dict(size=7, color="rgba(0,0,0,0.01)"),
+            customdata=np.column_stack([hp["depth"], hp["bottom"], np.where(hp["estimated"], "estimated", "measured")]),
+            hovertemplate=f"Depth at {shade_level:.1f} ft: <b>%{{customdata[0]:.0f}} ft</b><br>"
+                          "Bottom elevation: %{customdata[1]:.0f} ft (%{customdata[2]})<extra></extra>",
+            name="depth", showlegend=False))
+        fig.add_trace(ScatterMap(lon=[lake["lon"]], lat=[lake["lat"]], mode="markers+text",
+                                 marker=dict(size=11, color="red"), text=["Dam / gauge"],
+                                 textposition="top right", textfont=dict(color="white"),
+                                 hoverinfo="text", showlegend=False))
+        lon_span = bbox[2] - bbox[0]
+        zoom = math.log2(900 * 360 / (256 * lon_span)) - 0.2
+        fig.update_layout(**{map_key: dict(style="white-bg", layers=layers, zoom=zoom,
+                                           center=dict(lon=(bbox[0] + bbox[2]) / 2, lat=(bbox[1] + bbox[3]) / 2))},
+                          height=720, margin=dict(l=0, r=0, t=0, b=0))
+        st.plotly_chart(fig, **W, config={"scrollZoom": True})
+
+        st.markdown(
+            "<div style='font-size:0.9em'>"
+            "<span style='display:inline-block;width:120px;height:12px;background:linear-gradient(to right,#c6ecff,#041e5a);"
+            "vertical-align:middle'></span> shallow → deep &nbsp; "
+            "<span style='background:#deb870;padding:0 8px'>&nbsp;</span> lakebed exposed (below normal pool) &nbsp; "
+            "<span style='background:#ff781e;padding:0 8px'>&nbsp;</span> flooded land above normal pool &nbsp; "
+            "<span style='color:#e6c800'>━━</span> current shoreline &nbsp; "
+            "<span style='color:#ff00ff'>━━</span> projected shoreline &nbsp; "
+            "<span style='color:#ff69b4'>╍╍</span> projected likely range &nbsp; "
+            "<span style='color:#999'>╍╍</span> normal pool (white on map) &nbsp; thin white lines = 10-ft depth contours"
+            "</div>", unsafe_allow_html=True)
+
+        s_now, s_sel, s_norm = bed.stats(current), bed.stats(p_mid), bed.stats(lake["normal_pool"])
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Surface area now", f"{s_now['area_acres']:,.0f} ac",
+                  f"{s_now['area_acres'] / s_norm['area_acres'] - 1:+.1%} vs normal pool" if s_norm["area_acres"] else None)
+        m2.metric(f"Surface area {'projected ' + sel_date.strftime('%b %d') if sel_date != TODAY else 'today'}",
+                  f"{s_sel['area_acres']:,.0f} ac", f"{s_sel['area_acres'] - s_now['area_acres']:+,.0f} ac vs now")
+        m3.metric("Volume now (est.)", f"{s_now['volume_acft'] / 1000:,.0f}k ac-ft",
+                  f"{(s_sel['volume_acft'] - s_now['volume_acft']) / 1000:+,.0f}k ac-ft by selected date" if sel_date != TODAY else None)
+        m4.metric("Deepest point now (est.)", f"{s_now['max_depth_ft']:.0f} ft")
+
+        est_pct = bed.estimated.sum() / max(bed.lake_mask.sum(), 1)
+        st.caption(
+            f"Terrain: USGS 3DEP lidar (≈{bed.px_m:.0f} m pixels). The lidar was flown with the lake at about "
+            f"**{bed.lidar_level_ft:.1f} ft**, so ground above that level — banks, flats, coves and the flood pool — is "
+            f"measured. Depths below it are **estimated** ({est_pct:.0%} of the lake bed) from distance to shore and to "
+            f"the dam, scaled to a ~{lake.get('max_depth_ft', '?')} ft maximum depth"
+            + (f"; {bed.survey_used:,} uploaded soundings replace the estimate where they reach." if bed.survey_used else ".")
+            + " Not for navigation. Satellite imagery shows the lake on the day it was photographed, which may be a different level.")
+
+
+# ------------------------------------------------------------------------------------
 # Tab 2: weather
 # ------------------------------------------------------------------------------------
-with tabs[1]:
+with tabs[2]:
     if wx_fc.empty:
         st.warning("Weather forecast unavailable right now.")
     else:
@@ -422,7 +567,7 @@ with tabs[1]:
 # ------------------------------------------------------------------------------------
 # Tab 3: long range
 # ------------------------------------------------------------------------------------
-with tabs[2]:
+with tabs[3]:
     if seasonal.empty:
         seasonal = get_seasonal(lake["lat"], lake["lon"])
     if not seasonal.empty and not wx_hist.empty:
@@ -474,7 +619,7 @@ with tabs[2]:
 # ------------------------------------------------------------------------------------
 # Tab 4: inflows & Corps data
 # ------------------------------------------------------------------------------------
-with tabs[3]:
+with tabs[4]:
     if lake.get("upstream_usgs"):
         st.markdown("#### Rivers flowing into the lake (USGS)")
         fig = go.Figure()
@@ -519,7 +664,7 @@ with tabs[3]:
 # ------------------------------------------------------------------------------------
 # Tab 5: news
 # ------------------------------------------------------------------------------------
-with tabs[4]:
+with tabs[5]:
     items = get_news(tuple(lake["news_terms"]))
     if not items:
         st.info("No news found right now.")
@@ -540,7 +685,7 @@ with tabs[4]:
 # ------------------------------------------------------------------------------------
 # Tab 6: lake info
 # ------------------------------------------------------------------------------------
-with tabs[5]:
+with tabs[6]:
     left, right = st.columns([3, 2])
     with left:
         st.markdown("#### About the lake")
@@ -566,7 +711,7 @@ with tabs[5]:
 # ------------------------------------------------------------------------------------
 # Tab 7: model & sources
 # ------------------------------------------------------------------------------------
-with tabs[6]:
+with tabs[7]:
     st.markdown("#### How the projection works")
     st.markdown(
         "1. **Learn the lake's behavior** from its own daily record: how the level responds to watershed rain "
