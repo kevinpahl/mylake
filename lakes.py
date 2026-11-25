@@ -20,8 +20,8 @@ Add your own lakes by copying an entry. Anything left as None is simply skipped.
 LAKES = {
     "John H. Kerr Lake (Buggs Island), VA/NC": {
         "short": "Kerr Lake",
-        # depth map: area to map (lon_min, lat_min, lon_max, lat_max) - east edge stops at the dam
-        "map_bbox": (-78.90, 36.36, -78.302, 36.80),
+        # depth map: area to map (lon_min, lat_min, lon_max, lat_max), covering both the VA and NC sides
+        "map_bbox": (-78.92, 36.32, -78.27, 36.82),
         "max_depth_ft": 100,        # approx. deepest point at normal pool (near the dam)
         "datum_offset_ft": 0.9,     # NGVD29 minus NAVD88 here (approx.; fine-tune in the app)
         "usgs_site": "02079490",

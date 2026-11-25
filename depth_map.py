@@ -106,27 +106,40 @@ class LakeBed:
         self.seed = np.unravel_index(np.argmin(np.where(self.lake_mask, self.bottom_ft, np.inf)), self.bottom_ft.shape)
         self._cache = {}
 
-    # The lake is the largest perfectly flat (hydro-flattened) area near pool elevation
+    # Lidar shows the lake as perfectly flat ("hydro-flattened") water. A lake that spans
+    # several lidar projects (e.g. the VA and NC halves of Kerr) has one flat surface per
+    # project, each at the level the lake was when that project was flown. Find them all.
     def _find_lake_surface(self, land_ft):
         norm = self.lake["normal_pool"]
         lo = (self.lake.get("min_pool") or norm - 30) - 5
-        vals = land_ft[np.isfinite(land_ft) & (land_ft > lo) & (land_ft < norm + 12)]
-        if vals.size < 1000:
-            raise RuntimeError("Couldn't find the lake surface in the elevation data for this map area.")
-        bins = np.arange(lo, norm + 12, 0.05)
-        hist, edges = np.histogram(vals, bins=bins)
-        k = int(np.argmax(hist))
-        w = float(vals[(vals >= edges[k]) & (vals < edges[k + 1])].mean())
-        flat = np.abs(land_ft - w) < 0.3
+        hi = max(self.lake.get("flood_top") or norm + 10, norm) + 2
+        filled = np.where(np.isfinite(land_ft), land_ft, -9999.0)
+        local_range = ndi.maximum_filter(filled, 3) - ndi.minimum_filter(filled, 3)
+        flat = (local_range < 0.05) & (filled > lo) & (filled < hi)
         lab, n = ndi.label(flat)
         if n == 0:
-            raise RuntimeError("Lake surface not found.")
-        sizes = ndi.sum(flat, lab, index=np.arange(1, n + 1))
-        mask = lab == (int(np.argmax(sizes)) + 1)
-        mask = ndi.binary_closing(mask, iterations=2) & (land_ft < w + 1.5)
-        mask = ndi.binary_fill_holes(mask) & ~((land_ft > w + 1.5) & np.isfinite(land_ft))
-        self.lidar_level_ft = w
+            raise RuntimeError("Couldn't find the lake surface in the elevation data for this map area.")
+        idx = np.arange(1, n + 1)
+        sizes = ndi.sum(flat, lab, index=idx)
+        keep = idx[(sizes >= max(300, 0.02 * sizes.max()))]
+        surf = np.isin(lab, keep)
+        levels = ndi.mean(filled, lab, index=keep)
+        # per-pixel water-surface level, filled across seams between lidar projects
+        level_of_label = np.zeros(n + 1)
+        level_of_label[keep] = levels
+        w_pix = np.where(surf, level_of_label[lab], np.nan)
+        mask = ndi.binary_closing(surf, iterations=3)
+        mask = ndi.binary_fill_holes(mask)
+        _, (ni, nj) = ndi.distance_transform_edt(~surf, return_indices=True)
+        w_pix = w_pix[ni, nj]
+        mask &= ~(np.isfinite(land_ft) & (land_ft > w_pix + 1.5))
         self.lake_mask = mask
+        self.w_pix = w_pix
+        self.lidar_levels = sorted({round(float(v), 1) for v, s in zip(levels, sizes[keep - 1]) if s >= 0.05 * sizes.max()})
+        self.lidar_level_ft = float(np.average(levels, weights=sizes[keep - 1]))
+        # Water well below the lake surface outside the lake (e.g. the river below the dam)
+        # must never join the lake, even if the dam is broken up in the terrain data.
+        self.barrier = ~mask & np.isfinite(land_ft) & (land_ft < min(levels) - 15)
 
     def _estimate_depths(self, land_ft):
         m = self.lake_mask
@@ -138,11 +151,14 @@ class LakeBed:
         dist_dam = np.hypot(cx - dx, cy - dy) * self.scale
         L = max(np.percentile(dist_dam[m], 90), 1000.0)
         shape = (dist_shore ** 0.6) * (0.3 + 0.7 * np.exp(-dist_dam / (0.6 * L)))
-        max_depth_now = max(self.lake.get("max_depth_ft", 60) - (self.lake["normal_pool"] - self.lidar_level_ft), 5)
+        # max depth is quoted at normal pool: deepest bottom elevation is the same everywhere
+        deepest_bottom = self.lake["normal_pool"] - self.lake.get("max_depth_ft", 60)
         ref = np.percentile(shape[m], 99.7) if m.any() else 1.0
-        depth = np.clip(shape / ref * max_depth_now, 0, max_depth_now * 1.05)
-        depth = ndi.gaussian_filter(np.where(m, depth, 0), 1.0)
-        self.bottom_ft = np.where(m, self.lidar_level_ft - np.maximum(depth, 0.5), land_ft)
+        frac = np.clip(shape / ref, 0, 1.05)
+        bottom = self.w_pix - frac * np.maximum(self.w_pix - deepest_bottom, 5)
+        bottom = ndi.gaussian_filter(np.where(m, bottom, np.nan_to_num(self.w_pix, nan=self.lidar_level_ft)), 1.0)
+        bottom = np.minimum(bottom, self.w_pix - 0.5)
+        self.bottom_ft = np.where(m, bottom, land_ft)
         self.estimated = m.copy()
 
     def _apply_survey(self, df):
@@ -174,7 +190,7 @@ class LakeBed:
     def water(self, level_ft: float) -> np.ndarray:
         key = round(level_ft, 2)
         if key not in self._cache:
-            wet = self.bottom_ft < level_ft
+            wet = (self.bottom_ft < level_ft) & ~self.barrier
             lab, _ = ndi.label(wet)
             s = lab[self.seed]
             self._cache[key] = (lab == s) if s else np.zeros_like(wet)

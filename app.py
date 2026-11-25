@@ -502,7 +502,9 @@ with tabs[1]:
         est_pct = bed.estimated.sum() / max(bed.lake_mask.sum(), 1)
         st.caption(
             f"Terrain: USGS 3DEP lidar (≈{bed.px_m:.0f} m pixels). The lidar was flown with the lake at about "
-            f"**{bed.lidar_level_ft:.1f} ft**, so ground above that level — banks, flats, coves and the flood pool — is "
+            f"**{' / '.join(f'{v:.1f}' for v in bed.lidar_levels)} ft**"
+            f"{' (separate surveys for different parts of the lake)' if len(bed.lidar_levels) > 1 else ''}, "
+            "so ground above that level — banks, flats, coves and the flood pool — is "
             f"measured. Depths below it are **estimated** ({est_pct:.0%} of the lake bed) from distance to shore and to "
             f"the dam, scaled to a ~{lake.get('max_depth_ft', '?')} ft maximum depth"
             + (f"; {bed.survey_used:,} uploaded soundings replace the estimate where they reach." if bed.survey_used else ".")
