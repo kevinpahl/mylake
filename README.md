@@ -16,7 +16,15 @@ and put it in `.streamlit/secrets.toml` (see `secrets.toml.example`) or set the
 environment variable `USGS_API_KEY`. Without a key, USGS limits how many requests you can make
 per hour. The app caches everything, so normal use is fine either way.
 
-## What's on each tab
+## Layout and navigation
+
+* The lake picker and a **⚙️ Settings** button sit at the top of the page, so nothing is hidden in a sidebar on phones.
+* A large navigation bar with buttons for each page stays pinned to the top as you scroll. On narrow screens it scrolls sideways.
+* Every page ends with ← previous / next → buttons and a link back to the top.
+* The page you're on is saved in the address bar (`?page=map` and so on), so a refresh or bookmark brings you back to it.
+* On phones the app switches to a **compact layout** automatically: shorter charts, no chart toolbar, and metrics two per row. You can turn it on or off under ⚙️ Settings.
+
+## What's on each page
 
 | Tab | What it shows |
 |---|---|
@@ -29,7 +37,7 @@ per hour. The app caches everything, so normal use is fine either way.
 | Lake info | Facts, key elevations, record high and low in the data, links, and a map of the watershed points. |
 | Model & sources | How the projection works, how well it fits, a 30-day hindcast compared with "no change", and any data source that failed. |
 
-Sidebar: projection length (2–26 weeks), seasonal-outlook adjustment on/off, a rainfall
+⚙️ Settings: projection length (2–26 weeks), seasonal-outlook adjustment on/off, a rainfall
 scenario slider (e.g. 60% of normal = a dry spell), and years of history to learn from.
 
 ## How the projection works
@@ -54,7 +62,8 @@ has been in the past.
 * Lidar can't see underwater, and there's no public whole-lake survey of Kerr, so depths **below** that level are **estimated** from distance to shore and to the dam, scaled to the lake's approximate maximum depth (`max_depth_ft` in lakes.py). Treat the estimated depth colors as a rough picture, not a fishing or navigation chart.
 * If you have real soundings (sonar log export, survey points), upload a CSV with `lon, lat, bottom_elev_ft` in the map's settings and they replace the estimate wherever they reach.
 * Terrain is NAVD88 and Kerr's gauge is NGVD29. `datum_offset_ft` (~0.9 ft at Kerr) converts between them. Nudge it in the app if the white normal-pool line doesn't sit on the satellite shoreline.
-* The terrain download is cached for 30 days, so only the first load is slow.
+* The map is an interactive Leaflet map. Zoom in past the whole-lake view and it re-draws using sharper lidar terrain for just the area on screen (down to about 1–3 m). Shorelines are drawn as smooth lines instead of pixels, and you can click the water to read the depth.
+* The whole-lake terrain is cached for 30 days, and each zoomed-in view is cached too, so going back to an area is quick.
 
 ## Adding a lake
 
