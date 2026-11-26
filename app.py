@@ -20,7 +20,61 @@ from streamlit_folium import st_folium
 from lakes import DEFAULT_LAKE, LAKES, custom_lake
 from model import LakeModel, climatology_bands, guide_curve_series, outlook_ratio_by_month
 
-st.set_page_config(page_title="Lake Level Tracker", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="Lake Level Tracker", page_icon="🌊", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+
+def _user_agent():
+    try:
+        return st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        return ""
+
+
+_UA = _user_agent()
+IS_PHONE = ("Mobi" in _UA or "iPhone" in _UA) and "iPad" not in _UA
+IS_TABLET = ("iPad" in _UA or "Tablet" in _UA or ("Android" in _UA and "Mobi" not in _UA))
+
+st.markdown("""
+<style>
+/* ---------- navigation bar: big, always at the top ---------- */
+.st-key-topnav {
+    position: sticky; top: 3.6rem; z-index: 990;
+    background: #ffffff; padding: 0.35rem 0 0.45rem 0;
+    border-bottom: 1px solid rgba(128,128,128,0.25);
+    box-shadow: 0 4px 8px -6px rgba(0,0,0,0.25);
+}
+@media (prefers-color-scheme: dark) { .st-key-topnav { background: #0e1117; } }
+.st-key-topnav [data-testid="stButtonGroup"] > div,
+.st-key-topnav [role="radiogroup"] { flex-wrap: nowrap !important; overflow-x: auto; gap: 0.35rem;
+    scrollbar-width: thin; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+.st-key-topnav button, .st-key-topnav label {
+    min-height: 44px; font-size: 1.02rem !important; font-weight: 600; white-space: nowrap; flex: 0 0 auto;
+}
+.st-key-pager button { min-height: 44px; font-weight: 600; }
+/* ---------- general touch friendliness ---------- */
+button, [data-baseweb="select"] > div, input { min-height: 40px; }
+[data-testid="stMetricValue"] { font-size: 1.6rem; }
+/* ---------- tablets ---------- */
+@media (max-width: 1024px) {
+  .block-container { padding-left: 1.2rem !important; padding-right: 1.2rem !important; }
+}
+/* ---------- phones ---------- */
+@media (max-width: 640px) {
+  .block-container { padding: 0.6rem 0.6rem 3rem 0.6rem !important; }
+  h1 { font-size: 1.45rem !important; }
+  h4 { font-size: 1.05rem !important; }
+  [data-testid="stMetricValue"] { font-size: 1.25rem; }
+  [data-testid="stMetricLabel"] p { font-size: 0.8rem; }
+  [data-testid="stMetric"] { padding: 0.2rem 0; }
+  .st-key-topnav { top: 3.3rem; }
+  .st-key-topnav button { font-size: 0.95rem !important; padding: 0 0.7rem; }
+  /* keep pairs of metrics side by side instead of one long column */
+  .st-key-kpis [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem; }
+  .st-key-kpis [data-testid="stColumn"] { min-width: calc(50% - 0.4rem) !important; flex: 1 1 calc(50% - 0.4rem) !important; }
+}
+</style>
+""", unsafe_allow_html=True)
 
 TODAY = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
 
@@ -118,43 +172,61 @@ def fit_model(lake_key, guide_bp, level_hash, _level, _weather):
 
 
 # ------------------------------------------------------------------------------------
-# Sidebar
+# Top bar: lake picker + settings (no hidden sidebar - easier on phones and tablets)
 # ------------------------------------------------------------------------------------
-st.sidebar.title("🌊 Lake Level Tracker")
 names = list(LAKES) + ["➕ Other lake (enter a USGS gauge)"]
-choice = st.sidebar.selectbox("Lake or reservoir", names, index=names.index(DEFAULT_LAKE))
+t1, t2 = st.columns([3, 1], vertical_alignment="bottom")
+choice = t1.selectbox("🌊 Lake or reservoir", names, index=names.index(DEFAULT_LAKE))
+_settings = t2.popover("⚙️ Settings", **W)
 
 if choice.startswith("➕"):
-    with st.sidebar.expander("Custom lake", expanded=True):
+    with st.expander("Custom lake", expanded=True):
         c_name = st.text_input("Name", "My Lake")
         c_site = st.text_input("USGS site number (lake elevation gauge)", "")
-        c_lat = st.number_input("Latitude", value=36.0, format="%.4f")
-        c_lon = st.number_input("Longitude", value=-79.0, format="%.4f")
-        c_norm = st.number_input("Normal / full pool (ft)", value=300.0)
-        c_flood = st.number_input("Top of flood pool (ft)", value=320.0)
+        cc1, cc2 = st.columns(2)
+        c_lat = cc1.number_input("Latitude", value=36.0, format="%.4f")
+        c_lon = cc2.number_input("Longitude", value=-79.0, format="%.4f")
+        c_norm = cc1.number_input("Normal / full pool (ft)", value=300.0)
+        c_flood = cc2.number_input("Top of flood pool (ft)", value=320.0)
     if not c_site:
-        st.info("Enter a USGS site number in the sidebar to load a custom lake.")
+        st.info("Enter the lake's USGS site number above to load it.")
         st.stop()
     lake = custom_lake(c_name, c_site.strip(), c_lat, c_lon, c_norm, c_flood)
 else:
     lake = LAKES[choice]
 
-st.sidebar.markdown("### Projection settings")
-horizon = st.sidebar.slider("Projection length (days)", 14, 180, 90, step=7)
-use_outlook = st.sidebar.checkbox("Adjust for seasonal rainfall outlook", value=True,
-                                  help="Scales rainfall after the 16-day forecast by the ECMWF "
-                                       "seasonal outlook vs. normal for each month.")
-scenario = st.sidebar.slider("Rainfall scenario (% of normal after 16 days)", 50, 150, 100, step=5,
-                             help="Try 'what if it stays dry' (e.g. 60%) or 'wet winter' (130%).")
-years = st.sidebar.slider("Years of history to learn from", 5, 25, 15)
-show_members = st.sidebar.checkbox("Show individual scenarios", value=False)
+with _settings:
+    st.markdown("**Projection settings**")
+    horizon = st.slider("Projection length (days)", 14, 180, 90, step=7)
+    use_outlook = st.checkbox("Adjust for seasonal rainfall outlook", value=True,
+                              help="Scales rainfall after the 16-day forecast by the ECMWF "
+                                   "seasonal outlook vs. normal for each month.")
+    scenario = st.slider("Rainfall scenario (% of normal after 16 days)", 50, 150, 100, step=5,
+                         help="Try 'what if it stays dry' (e.g. 60%) or 'wet winter' (130%).")
+    years = st.slider("Years of history to learn from", 5, 25, 15)
+    show_members = st.checkbox("Show individual scenarios", value=False)
+    st.markdown("**Display**")
+    COMPACT = st.toggle("Compact layout (phones)", value=IS_PHONE,
+                        help="Shorter charts and simpler toolbars. Turned on automatically on phones.")
+    if st.button("🔄 Refresh all data", **W):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    st.caption("Data refreshes automatically (levels every 15 min, weather every 2 h). "
+               + ("USGS API key loaded." if USGS_KEY else "Tip: add a free USGS API key (see README)."))
 
-if st.sidebar.button("🔄 Refresh all data"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.rerun()
-st.sidebar.caption(f"Data refreshes automatically (levels every 15 min, weather every 2 h). "
-                   f"{'USGS API key loaded.' if USGS_KEY else 'Tip: add a free USGS API key (see README).'}")
+
+def show_chart(fig, height=None):
+    """Plotly chart sized for the device: shorter, no toolbar, no accidental zoom on phones."""
+    h = height or fig.layout.height or 400
+    if COMPACT:
+        fig.update_layout(height=min(h, 360), margin=dict(l=4, r=4, t=36, b=4),
+                          legend=dict(orientation="h", y=-0.25, font=dict(size=10)), font=dict(size=11))
+        cfg = {"displayModeBar": False, "scrollZoom": False, "responsive": True}
+    else:
+        cfg = {"displaylogo": False, "responsive": True}
+    st.plotly_chart(fig, **W, config=cfg)
+
 
 # ------------------------------------------------------------------------------------
 # Load data
@@ -244,11 +316,58 @@ else:
     model_error = "Rainfall history (Open-Meteo) could not be loaded."
 
 # ------------------------------------------------------------------------------------
-# Header
+# Header + navigation
 # ------------------------------------------------------------------------------------
-st.title(f"{lake['short']} — level tracker & outlook")
-st.caption(f"Elevations in feet ({lake.get('datum', '')}). Lake level from {level_source}. "
-           f"Last reading {current_time:%b %d, %Y %I:%M %p}.")
+st.markdown("<div id='lake-top'></div>", unsafe_allow_html=True)
+st.title(f"{lake['short']} — {current:.2f} ft")
+st.caption(f"{current - lake['normal_pool']:+.2f} ft vs. normal pool ({lake['normal_pool']:g}) · "
+           f"last reading {current_time:%b %d, %I:%M %p} · elevations in feet ({lake.get('datum', '')}) · "
+           f"source: {level_source}")
+
+PAGES = {
+    "level": ("📈", "Level & projection"),
+    "map": ("🗺️", "Depth map"),
+    "weather": ("🌧️", "Weather"),
+    "outlook": ("🗓️", "Long-range"),
+    "inflows": ("🏞️", "Inflows & Corps"),
+    "news": ("📰", "News"),
+    "info": ("ℹ️", "Lake info"),
+    "model": ("⚙️", "Model & sources"),
+}
+PAGE_KEYS = list(PAGES)
+if "page" not in st.session_state:
+    qp = st.query_params.get("page")
+    st.session_state.page = qp if qp in PAGES else "level"
+
+
+def _label(k):
+    icon, name = PAGES[k]
+    return f"{icon} {name}"
+
+
+def _go(k):
+    st.session_state.page = k
+    st.session_state.nav = k
+
+
+def _nav_changed():
+    if st.session_state.nav is None:          # tapped the active button again: stay put
+        st.session_state.nav = st.session_state.page
+    else:
+        st.session_state.page = st.session_state.nav
+
+
+if "nav" not in st.session_state:
+    st.session_state.nav = st.session_state.page
+with st.container(key="topnav"):
+    if hasattr(st, "segmented_control"):
+        st.segmented_control("Go to", PAGE_KEYS, format_func=_label, key="nav", on_change=_nav_changed,
+                             label_visibility="collapsed")
+    else:
+        st.radio("Go to", PAGE_KEYS, format_func=_label, key="nav", horizontal=True,
+                 on_change=_nav_changed, label_visibility="collapsed")
+page = st.session_state.page
+st.query_params["page"] = page   # page survives refresh and can be bookmarked / shared
 
 fc_nws, alerts = get_nws(lake["lat"], lake["lon"])
 for a in alerts:
@@ -262,34 +381,48 @@ def _delta(days):
     return current - float(past.iloc[-1]) if len(past) else None
 
 
-c = st.columns(6)
-c[0].metric("Current level", f"{current:.2f} ft",
-            f"{_delta(1):+.2f} ft (24h)" if _delta(1) is not None else None)
-c[1].metric("vs. normal pool", f"{current - lake['normal_pool']:+.2f} ft", help=f"Normal pool {lake['normal_pool']} ft")
-c[2].metric("vs. guide curve today", f"{current - guide_today:+.2f} ft", help=f"Guide curve ≈ {guide_today:.1f} ft today")
-c[3].metric("7-day change", f"{_delta(7):+.2f} ft" if _delta(7) is not None else "—")
-c[4].metric("30-day change", f"{_delta(30):+.2f} ft" if _delta(30) is not None else "—")
-doy = TODAY.dayofyear
-if doy in clim.index:
-    med = clim.loc[doy, "median"]
-    c[5].metric("vs. typical for date", f"{current - med:+.2f} ft", help=f"Median for this date ≈ {med:.1f} ft")
+def pager():
+    """Previous / next buttons at the bottom of each page (handy on phones)."""
+    i = PAGE_KEYS.index(page)
+    st.divider()
+    with st.container(key="pager"):
+        b1, b2, b3 = st.columns([1, 1, 1])
+        if i > 0:
+            b1.button(f"← {_label(PAGE_KEYS[i - 1])}", on_click=_go, args=(PAGE_KEYS[i - 1],), **W)
+        b2.markdown("<div style='text-align:center;padding-top:0.6rem'><a href='#lake-top'>⬆ Top</a></div>",
+                    unsafe_allow_html=True)
+        if i < len(PAGE_KEYS) - 1:
+            b3.button(f"{_label(PAGE_KEYS[i + 1])} →", on_click=_go, args=(PAGE_KEYS[i + 1],), **W)
 
-if proj is not None:
-    marks = [d for d in [14, 28, 56, 84, 120, 180] if d <= horizon]
-    cols = st.columns(len(marks))
-    for col, d in zip(cols, marks):
-        row = proj.iloc[d - 1]
-        rng = f"{row['p10']:.1f}–{row['p90']:.1f} ft" if "p10" in row else ""
-        col.metric(f"Projected in {d // 7} wks ({proj.index[d - 1]:%b %d})", f"{row['p50']:.1f} ft",
-                   f"{row['p50'] - current:+.1f} ft · range {rng}", delta_color="off")
-
-tabs = st.tabs(["📈 Level & projection", "🗺️ Depth map", "🌧️ Weather (next 16 days)", "🗓️ Long-range outlook",
-                "🏞️ Inflows & Corps data", "📰 News", "ℹ️ Lake info", "⚙️ Model & sources"])
 
 # ------------------------------------------------------------------------------------
 # Tab 1: level & projection
 # ------------------------------------------------------------------------------------
-with tabs[0]:
+if page == "level":
+    with st.container(key="kpis"):
+        c = st.columns(3)
+        c[0].metric("Current level", f"{current:.2f} ft",
+                    f"{_delta(1):+.2f} ft (24h)" if _delta(1) is not None else None)
+        c[1].metric("vs. normal pool", f"{current - lake['normal_pool']:+.2f} ft", help=f"Normal pool {lake['normal_pool']} ft")
+        c[2].metric("vs. guide curve today", f"{current - guide_today:+.2f} ft", help=f"Guide curve ≈ {guide_today:.1f} ft today")
+        c = st.columns(3)
+        c[0].metric("7-day change", f"{_delta(7):+.2f} ft" if _delta(7) is not None else "—")
+        c[1].metric("30-day change", f"{_delta(30):+.2f} ft" if _delta(30) is not None else "—")
+        doy = TODAY.dayofyear
+        if doy in clim.index:
+            med = clim.loc[doy, "median"]
+            c[2].metric("vs. typical for date", f"{current - med:+.2f} ft", help=f"Median for this date ≈ {med:.1f} ft")
+
+        if proj is not None:
+            st.markdown("#### Projected level")
+            marks = [d for d in [14, 28, 56, 84, 120, 180] if d <= horizon]
+            for k in range(0, len(marks), 3):
+                cols = st.columns(3)
+                for col, d in zip(cols, marks[k:k + 3]):
+                    row = proj.iloc[d - 1]
+                    rng = f"{row['p10']:.1f}–{row['p90']:.1f}" if "p10" in row else ""
+                    col.metric(f"In {d // 7} wks ({proj.index[d - 1]:%b %d})", f"{row['p50']:.1f} ft",
+                               f"{row['p50'] - current:+.1f} ft · likely {rng}", delta_color="off")
     lookback = st.select_slider("Show history", ["90 days", "6 months", "1 year", "2 years", "5 years"],
                                 value="1 year")
     lb_days = {"90 days": 90, "6 months": 182, "1 year": 365, "2 years": 730, "5 years": 1826}[lookback]
@@ -342,7 +475,7 @@ with tabs[0]:
     fig.update_layout(height=560, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10),
                       yaxis_title=f"Elevation (ft {lake.get('datum', '')})",
                       legend=dict(orientation="h", y=-0.12))
-    st.plotly_chart(fig, **W)
+    show_chart(fig)
 
     if model_error:
         st.warning(f"Projection unavailable: {model_error}")
@@ -451,7 +584,7 @@ def render_map(lake, bed, bbox, basemap, shade_level, opacity, contour_ft, line_
                   icon=folium.Icon(color="red", icon="tint")).add_to(m)
     folium.LayerControl(collapsed=True).add_to(m)
 
-    out = st_folium(m, key=key, height=720, use_container_width=True,
+    out = st_folium(m, key=key, height=480 if COMPACT else 680, use_container_width=True,
                     returned_objects=["bounds", "zoom", "center", "last_clicked"])
 
     clicked = (out or {}).get("last_clicked")
@@ -475,7 +608,7 @@ def render_map(lake, bed, bbox, basemap, shade_level, opacity, contour_ft, line_
         "</div>", unsafe_allow_html=True)
 
 
-with tabs[1]:
+if page == "map":
     st.markdown("Water depth and shoreline on satellite imagery. **Zoom in and the map re-draws in more detail** "
                 "(down to ~1–3 m from USGS lidar). Click anywhere on the water to read the depth.")
     o1, o2, o3, o4 = st.columns([1.3, 1, 1, 1])
@@ -568,7 +701,7 @@ with tabs[1]:
 # ------------------------------------------------------------------------------------
 # Tab 2: weather
 # ------------------------------------------------------------------------------------
-with tabs[2]:
+if page == "weather":
     if wx_fc.empty:
         st.warning("Weather forecast unavailable right now.")
     else:
@@ -599,7 +732,7 @@ with tabs[2]:
                           hovermode="x unified", legend=dict(orientation="h", y=-0.2),
                           margin=dict(l=10, r=10, t=30, b=10),
                           title="Watershed rainfall & temperature (average of points across the drainage basin)")
-        st.plotly_chart(fig, **W)
+        show_chart(fig)
 
         mc = get_model_comparison(lake["lat"], lake["lon"])
         if not mc.empty:
@@ -609,7 +742,7 @@ with tabs[2]:
                 fig.add_trace(go.Scatter(x=mc.index, y=mc[col].fillna(0).cumsum(), name=col, mode="lines"))
             fig.update_layout(height=320, yaxis_title="Cumulative rain (in)", hovermode="x unified",
                               margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, **W)
+            show_chart(fig)
 
     st.markdown(f"#### National Weather Service forecast{' — ' + fc_nws.get('city', '') if fc_nws.get('city') else ''}")
     periods = fc_nws.get("periods", [])
@@ -623,7 +756,7 @@ with tabs[2]:
 # ------------------------------------------------------------------------------------
 # Tab 3: long range
 # ------------------------------------------------------------------------------------
-with tabs[3]:
+if page == "outlook":
     if seasonal.empty:
         seasonal = get_seasonal(lake["lat"], lake["lon"])
     if not seasonal.empty and not wx_hist.empty:
@@ -638,7 +771,7 @@ with tabs[3]:
         fig = go.Figure([go.Bar(x=df.index.strftime("%b %Y"), y=df["Normal (in)"], name="Normal", marker_color="lightgray"),
                          go.Bar(x=df.index.strftime("%b %Y"), y=df["Outlook (in)"], name="Seasonal outlook", marker_color="#3182bd")])
         fig.update_layout(barmode="group", height=340, yaxis_title="Rain (in)", margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, **W)
+        show_chart(fig)
         st.caption("Ensemble mean of the ECMWF EC46 / SEAS5 seasonal models via Open-Meteo. Partial months are "
                    "compared against normal for the same number of days. Seasonal rainfall forecasts have modest skill — "
                    "treat them as a tilt in the odds, not a prediction.")
@@ -670,12 +803,12 @@ with tabs[3]:
                 fig.add_trace(go.Scatter(x=g["Week"], y=g["D1"], name=county, mode="lines+markers"))
             fig.update_layout(height=280, yaxis_title="% of county in moderate drought or worse",
                               margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, **W)
+            show_chart(fig)
 
 # ------------------------------------------------------------------------------------
 # Tab 4: inflows & Corps data
 # ------------------------------------------------------------------------------------
-with tabs[4]:
+if page == "inflows":
     if lake.get("upstream_usgs"):
         st.markdown("#### Rivers flowing into the lake (USGS)")
         fig = go.Figure()
@@ -686,7 +819,7 @@ with tabs[4]:
         if fig.data:
             fig.update_layout(height=340, yaxis_title="Flow (cfs)", yaxis_type="log", hovermode="x unified",
                               margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
-            st.plotly_chart(fig, **W)
+            show_chart(fig)
         else:
             st.info("Upstream river data unavailable right now.")
 
@@ -697,7 +830,7 @@ with tabs[4]:
             fig = go.Figure(go.Scatter(x=s.index, y=s.values, name=kind))
             fig.update_layout(height=260, title=f"{kind} — {info['tsid']} ({info['units']})",
                               margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, **W)
+            show_chart(fig)
         if "Inflow" in cwms and "Outflow" in cwms:
             i = cwms["Inflow"]["series"].resample("D").mean()
             o = cwms["Outflow"]["series"].resample("D").mean()
@@ -720,7 +853,7 @@ with tabs[4]:
 # ------------------------------------------------------------------------------------
 # Tab 5: news
 # ------------------------------------------------------------------------------------
-with tabs[5]:
+if page == "news":
     items = get_news(tuple(lake["news_terms"]))
     if not items:
         st.info("No news found right now.")
@@ -741,7 +874,7 @@ with tabs[5]:
 # ------------------------------------------------------------------------------------
 # Tab 6: lake info
 # ------------------------------------------------------------------------------------
-with tabs[6]:
+if page == "info":
     left, right = st.columns([3, 2])
     with left:
         st.markdown("#### About the lake")
@@ -767,7 +900,7 @@ with tabs[6]:
 # ------------------------------------------------------------------------------------
 # Tab 7: model & sources
 # ------------------------------------------------------------------------------------
-with tabs[7]:
+if page == "model":
     st.markdown("#### How the projection works")
     st.markdown(
         "1. **Learn the lake's behavior** from its own daily record: how the level responds to watershed rain "
@@ -789,7 +922,7 @@ with tabs[7]:
             fig = go.Figure([go.Scatter(x=hc["start"] + pd.Timedelta(days=30), y=hc["observed"], mode="markers", name="Observed"),
                              go.Scatter(x=hc["start"] + pd.Timedelta(days=30), y=hc["model"], mode="markers", name="Model (30 days ahead)")])
             fig.update_layout(height=300, yaxis_title="Elevation (ft)", margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig, **W)
+            show_chart(fig)
             st.caption("Hindcasts use observed rain, so real-world error is larger because the rain forecast is uncertain.")
         with st.expander("Model coefficients"):
             st.dataframe(model.coefficients(), hide_index=True)
@@ -809,3 +942,5 @@ with tabs[7]:
             st.json(ds.SOURCE_ERRORS)
     else:
         st.success("No source problems reported on this load (cached results are re-checked when they expire).")
+
+pager()
